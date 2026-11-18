@@ -1,0 +1,20 @@
+{
+  "name": "llm-call-deadline",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A wall-clock deadline for LLM and fetch calls that does not depend on AbortSignal being honored.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/guarded-call.js",
+  "types": "./dist/guarded-call.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.tests.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.9"
+  }
+}
