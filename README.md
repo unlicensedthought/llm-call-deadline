@@ -2,6 +2,8 @@
 
 A wall-clock deadline for LLM and `fetch` calls that does not trust `AbortSignal`.
 
+Write-up: [My AbortSignal was correct and the call still hung for six hours](https://unlicensedthought.com/writing/my-abortsignal-was-correct-and-the-call-still-hung/)
+
 ## The problem
 
 The usual timeout for a model call is an `AbortController` plus a `setTimeout`
