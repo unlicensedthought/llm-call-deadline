@@ -16,7 +16,7 @@ I found no upstream documentation of it either way.
 ## Quick start
 
 ```ts
-import { guardedCall, guardedFetchText, guardedBindingRun } from "./src/guarded-call.js";
+import { guardedCall, guardedFetchText, guardedBindingRun, guardedStream } from "./src/guarded-call.js";
 
 // Any async call. The signal is passed in as a courtesy.
 const out = await guardedCall("summarize", 30_000, (signal) =>
@@ -31,10 +31,19 @@ const { res, text } = await guardedFetchText("chat", 30_000, url, {
 
 // A binding that takes no signal at all.
 const r = await guardedBindingRun("embed", 10_000, () => env.AI.run(model, input));
+
+// A streamed body: a fresh idle timer per chunk, plus a cap on the whole read.
+const res = await guardedCall("stream-open", 30_000, (signal) => fetch(url, { signal }));
+const bytes = await guardedStream(
+  "stream",
+  { idleMs: 15_000, totalMs: 120_000 },
+  res.body!,
+  (chunk) => process(chunk), // optional, called synchronously per chunk
+);
 ```
 
 On timeout each one rejects with `GuardedCallTimeoutError`
-(`label`, `timeoutMs`, `phase`: `"call"` or `"body"`).
+(`label`, `timeoutMs`, `phase`: `"call"`, `"body"` or `"idle"`).
 
 ## How it works
 
@@ -42,6 +51,13 @@ On timeout each one rejects with `GuardedCallTimeoutError`
 fires it calls `controller.abort()` without awaiting it, then rejects. The
 rejection does not depend on the abort doing anything. The timer is cleared in
 a `finally`, so a call that finishes leaves nothing behind.
+
+`guardedStream` applies the same idea to a streamed body. Each chunk read is
+raced against its own `idleMs` timer, which is replaced after every chunk, and
+the whole read is raced against one `totalMs` timer. When either fires it
+rejects first, then calls `reader.cancel()` without awaiting it, so a reader
+that ignores cancel still cannot hold the caller. An idle timeout has phase
+`"idle"` and a `totalMs` timeout has phase `"body"`.
 
 ## Limits
 
@@ -51,7 +67,12 @@ a `finally`, so a call that finishes leaves nothing behind.
 - The deadline is one number per call. It has no retry, backoff or budget logic.
   Wrap it in your own retry loop.
 - It does not cancel a call that has already produced side effects.
-- Streaming responses are not handled. The deadline covers the whole read.
+- Streaming: `guardedStream` bounds the wait for each chunk and the total read
+  time of a `ReadableStream<Uint8Array>`. It buffers and returns every chunk, so
+  it is not for unbounded streams. It does not bound your own work: `onChunk`
+  runs synchronously inside the loop, and a slow `onChunk` delays the next read
+  but is not itself timed. Server-sent-event parsing and per-event semantics are
+  yours. The fetch that opens the stream is bounded separately (see the example).
 - The runtime behavior behind the original hangs is an observation, not a
   documented guarantee.
 

@@ -25,16 +25,19 @@
  */
 
 /**
- * Thrown when a call exceeds its `timeoutMs` deadline. `phase` is `'call'` for
+ * Thrown when a call exceeds its deadline. `phase` is `'call'` for
  * `guardedCall` and `guardedBindingRun`, and `'body'` for `guardedFetchText`,
- * where the deadline covers both the `fetch()` and the body read.
+ * where the deadline covers both the `fetch()` and the body read. For
+ * `guardedStream`, `'idle'` means one chunk read went `idleMs` without
+ * producing data (`timeoutMs` is then `idleMs`), and `'body'` means the whole
+ * read passed `totalMs` (`timeoutMs` is then `totalMs`).
  */
 export class GuardedCallTimeoutError extends Error {
   readonly code = "GUARDED_CALL_TIMEOUT" as const;
   constructor(
     readonly label: string,
     readonly timeoutMs: number,
-    readonly phase: "call" | "body",
+    readonly phase: "call" | "body" | "idle",
   ) {
     super(`guardedCall[${label}] exceeded ${timeoutMs}ms in phase '${phase}'`);
     this.name = "GuardedCallTimeoutError";
@@ -110,4 +113,93 @@ export async function guardedBindingRun<T>(
   run: () => Promise<T>,
 ): Promise<T> {
   return guardedCall(label, timeoutMs, () => run());
+}
+
+/** Deadlines for `guardedStream`, both in milliseconds. */
+export interface StreamDeadlines {
+  /** Longest allowed wait for any single chunk. Restarted after every chunk. */
+  idleMs: number;
+  /** Longest allowed wall-clock time for the whole read. */
+  totalMs: number;
+}
+
+/**
+ * Cancel the reader as fire-and-forget cleanup. It is never awaited and never
+ * on the reject path. A failing cancel is reported, not swallowed.
+ */
+function cancelReader(label: string, reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  const report = (err: unknown) => console.warn(`guardedStream[${label}] reader.cancel() failed`, err);
+  try {
+    reader.cancel().catch(report);
+  } catch (err) {
+    report(err);
+  }
+}
+
+/**
+ * Read a streamed body to the end under two independent wall-clock deadlines:
+ * each chunk read is raced against its own `idleMs` timer (restarted on every
+ * chunk), and the whole read is raced against `totalMs`. Rejects with
+ * `GuardedCallTimeoutError` whose `phase` is `'idle'` or `'body'`.
+ *
+ * Like the other guards, rejection never depends on the stream cooperating:
+ * on timeout the reject comes first and `reader.cancel()` is called without
+ * being awaited, so a reader that ignores cancel still cannot hold the caller.
+ *
+ * `onChunk` is called synchronously for each chunk, so no caller code runs
+ * between reads that the deadlines do not cover. Returns every chunk
+ * concatenated.
+ */
+export async function guardedStream(
+  label: string,
+  { idleMs, totalMs }: StreamDeadlines,
+  body: ReadableStream<Uint8Array>,
+  onChunk?: (chunk: Uint8Array) => void,
+): Promise<Uint8Array> {
+  const reader = body.getReader();
+  let totalTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutAfter = (ms: number, phase: "idle" | "body") =>
+    new Promise<never>((_resolve, reject) => {
+      const timer = setTimeout(() => {
+        // Reject first: cancelling can resolve a pending read as `done`,
+        // and that must not win the race and pass off a cut-short read.
+        reject(new GuardedCallTimeoutError(label, ms, phase));
+        cancelReader(label, reader);
+      }, ms);
+      if (phase === "body") totalTimer = timer;
+      else idleTimer = timer;
+    });
+  const total = timeoutAfter(totalMs, "body");
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const idle = timeoutAfter(idleMs, "idle");
+      let result: ReadableStreamReadResult<Uint8Array>;
+      try {
+        result = await Promise.race([reader.read(), idle, total]);
+      } finally {
+        if (idleTimer !== undefined) clearTimeout(idleTimer);
+      }
+      if (result.done) break;
+      chunks.push(result.value);
+      length += result.value.byteLength;
+      onChunk?.(result.value);
+    }
+  } catch (err) {
+    // `onChunk` or the stream itself threw: stop reading. After a timeout the
+    // cancel has already been issued.
+    if (!(err instanceof GuardedCallTimeoutError)) cancelReader(label, reader);
+    throw err;
+  } finally {
+    if (totalTimer !== undefined) clearTimeout(totalTimer);
+  }
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
 }
